@@ -20,3 +20,6 @@ ufs-utils
 *project
 
 /Debug/
+
+# FreeBSD build stages the ufshci headers here.
+compat/dev/
