@@ -1,0 +1,106 @@
+"""Reach the ufshci test targets over ssh.
+
+Two targets exist. "qemu" is the amd64 test VM, reached as root directly.
+"gb" is the Galaxy Book, an arm64 machine that refuses a root login, so
+every command goes through su.
+
+The gb command is wrapped in su -m root -c, so it has to survive one
+extra round of shell parsing. That wrapping uses shlex.quote, which is
+shell quoting; repr() is Python quoting and produces \' inside a single
+quoted string, where the backslash is literal and the quote ends the
+string. A command carrying a quote of its own broke that way.
+"""
+
+import pexpect
+import shlex
+import sys
+import time
+
+TARGETS = {
+    "qemu": {
+        "host": "root@REPLACE_ME",
+        "password": "REPLACE_ME",
+        "su": False,
+        "arch": "amd64.amd64",
+    },
+    "gb": {
+        "host": "user@REPLACE_ME",
+        "password": "REPLACE_ME",
+        "su": True,
+        "arch": "arm64.aarch64",
+    },
+}
+
+DONE = "__UFSHCI_DONE__"
+
+
+def _spawn(argv, timeout, stream):
+    child = pexpect.spawn(argv[0], argv[1:], timeout=timeout, encoding="utf-8")
+    if stream:
+        child.logfile_read = sys.stdout
+    return child
+
+
+def ssh_run(target, cmd, timeout=120, stream=True):
+    """Run cmd on the target. Returns (output, timed_out)."""
+    spec = TARGETS[target]
+    if spec["su"]:
+        remote = "su -m root -c " + shlex.quote(cmd + "; echo " + DONE)
+    else:
+        remote = cmd + "; echo " + DONE
+
+    child = _spawn(
+        ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=15",
+         "-x", spec["host"], remote],
+        timeout, stream)
+
+    out = []
+    timed_out = False
+    while True:
+        i = child.expect([r"[Pp]assword[^:]*:", DONE, pexpect.EOF, pexpect.TIMEOUT])
+        if i == 0:
+            time.sleep(0.3)
+            child.sendline(spec["password"])
+            continue
+        out.append(child.before or "")
+        timed_out = (i == 3)
+        break
+
+    child.close(force=True)
+    return "".join(out).replace("\r\n", "\n"), timed_out
+
+
+def scp_push(target, local, remote, timeout=300):
+    """Copy a local file to the target."""
+    spec = TARGETS[target]
+    child = _spawn(
+        ["scp", "-o", "StrictHostKeyChecking=no", local,
+         spec["host"] + ":" + remote],
+        timeout, False)
+    while True:
+        i = child.expect([r"[Pp]assword[^:]*:", pexpect.EOF, pexpect.TIMEOUT])
+        if i == 0:
+            time.sleep(0.3)
+            child.sendline(spec["password"])
+            continue
+        break
+    child.close(force=True)
+    return child.exitstatus == 0
+
+
+def scp_pull(target, remote, local, timeout=300):
+    """Copy a file from the target to here."""
+    spec = TARGETS[target]
+    child = _spawn(
+        ["scp", "-o", "StrictHostKeyChecking=no",
+         spec["host"] + ":" + remote, local],
+        timeout, False)
+    while True:
+        i = child.expect([r"[Pp]assword[^:]*:", pexpect.EOF, pexpect.TIMEOUT])
+        if i == 0:
+            time.sleep(0.3)
+            child.sendline(spec["password"])
+            continue
+        break
+    child.close(force=True)
+    return child.exitstatus == 0
