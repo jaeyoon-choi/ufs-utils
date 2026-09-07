@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""Push this tree to the FreeBSD test target and run commands there.
+
+    ./fb push               copy the tree to the target
+    ./fb run '<command>'    run a command on the target
+    ./fb build              push, then gmake on the target
+    ./fb test               build and run the tools tests
+
+The target uses password auth, so every call goes through the pexpect
+wrapper the ufshci test suite already carries. Nothing here talks to ssh
+on its own.
+"""
+
+import os
+import subprocess
+import sys
+import tarfile
+import tempfile
+
+# The ssh/scp harness lives in test/host. It holds credentials, so the
+# repo carries only target.py.example. Copy it to test/host/target.py and
+# fill in your hosts. The old out of tree path stays as a fallback.
+_here = os.path.dirname(os.path.abspath(__file__))
+for _p in (os.path.join(_here, "test", "host"), "/data/ufshci-tests/host"):
+    if os.path.exists(os.path.join(_p, "target.py")):
+        sys.path.insert(0, _p)
+        break
+import target  # noqa: E402
+
+TARGET = os.environ.get("UFS_TARGET", "qemu")
+TOPDIR = os.path.dirname(os.path.abspath(__file__))
+REMOTE = "/root/ufs-utils"
+SKIP = {".git", "baseline", "__pycache__"}
+
+
+def run(cmd, timeout=180, stream=True):
+    """Run cmd on the target. Returns its output.
+
+    A non interactive ssh shell does not carry /usr/local/bin, which is
+    where pkg puts gmake.
+    """
+    cmd = "PATH=/usr/local/bin:$PATH; " + cmd
+    out, timed_out = target.ssh_run(TARGET, cmd, timeout=timeout,
+                                    stream=stream)
+    if timed_out:
+        sys.exit("timed out running: %s" % cmd)
+    return out
+
+
+def push():
+    """Copy the working tree over, replacing what is there."""
+    def keep(info):
+        parts = info.name.split("/")
+        if any(p in SKIP for p in parts):
+            return None
+        return info
+
+    fd, tarpath = tempfile.mkstemp(suffix=".tar")
+    os.close(fd)
+    try:
+        with tarfile.open(tarpath, "w") as tf:
+            for name in sorted(os.listdir(TOPDIR)):
+                if name in SKIP:
+                    continue
+                tf.add(os.path.join(TOPDIR, name), arcname=name, filter=keep)
+
+        if not target.scp_push(TARGET, tarpath, "/tmp/ufs-utils.tar"):
+            sys.exit("scp failed")
+    finally:
+        os.unlink(tarpath)
+
+    # The ufshci headers come from /usr/include, installed by the kernel.
+    run("rm -rf %s && mkdir -p %s && tar -xf /tmp/ufs-utils.tar -C %s"
+        % (REMOTE, REMOTE, REMOTE), stream=False)
+    print("pushed to %s:%s" % (TARGET, REMOTE))
+
+
+def main():
+    if len(sys.argv) < 2:
+        sys.exit(__doc__)
+
+    action = sys.argv[1]
+    if action == "push":
+        push()
+    elif action == "run":
+        if len(sys.argv) < 3:
+            sys.exit("run needs a command")
+        print(run(" ".join(sys.argv[2:])))
+    elif action == "build":
+        push()
+        print(run("cd %s && gmake clean >/dev/null && "
+                  "gmake 2>&1 | grep -E 'warning:|error:|\\*\\*\\*' | "
+                  "sed 's/^\\([^:]*:[0-9]*\\).*\\(\\[-W.*\\)/\\1 \\2/' | "
+                  "sort -u; echo '--- build done ---'" % REMOTE))
+    elif action == "test":
+        # push wipes the remote tree, so build first and rebuild the tools.
+        print(run("cd %s && gmake >/dev/null 2>&1; "
+                  "cc -I. -I compat -o tools/ufshci_pt_test "
+                  "tools/ufshci_pt_test.c && "
+                  # freebsd_transport.o calls sense_key_string in
+                  # scsi_bsg_util.o. The test tool carries a print_error stub
+                  # so that object links without dragging in ufs.c and main.
+                  "cc -I. -I compat -o tools/pass_inquiry_test "
+                  "tools/pass_inquiry_test.c freebsd_transport.o "
+                  "scsi_bsg_util.o && "
+                  "cc -I. -I compat -include limits.h -D_UAPI_LINUX_LIMITS_H "
+                  "-o tools/layout_test tools/layout_test.c && "
+                  "./tools/layout_test && "
+                  "./tools/ufshci_pt_test && ./tools/pass_inquiry_test"
+                  % REMOTE))
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    main()
